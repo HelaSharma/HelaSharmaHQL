@@ -1,0 +1,217 @@
+/**
+ * HQL Ops Board — served entirely from Apps Script
+ *
+ * SETUP (only re-do the parts that changed):
+ * 1. Replace this file's contents in your existing Apps Script project.
+ * 2. Re-paste Dashboard.html if it changed too.
+ * 3. Save (Ctrl+S), then Deploy → Manage deployments → pencil icon →
+ *    Version: New version → Deploy.
+ * 4. ONE-TIME EXTRA STEP for the Lead Scoring auto-update feature:
+ *    In the Apps Script toolbar, use the function dropdown (next to the
+ *    "Run" button) to select "setupLeadScoringTrigger", then click Run.
+ *    It'll ask you to authorize — approve it. This only needs to be done
+ *    once, ever. It installs a trigger that watches the Lead Scoring
+ *    sheet and auto-stamps AA1 with the agent's name whenever they enter
+ *    a score, so you don't need agents to type into AA1 manually for
+ *    that sheet anymore.
+ */
+
+function doGet(e) {
+  return HtmlService.createHtmlOutputFromFile('Dashboard')
+    .setTitle('HQL Ops Board')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+}
+
+const LEAD_SCORING_ID = '1ggnvkOrmLHdoxjYgC5AzrAIWF2MIVeLqEGRw1qiXdlI';
+
+// Called from the client via google.script.run.
+function getBoardData() {
+  const SHEETS = [
+    { key: 'A-01', id: LEAD_SCORING_ID, gid: 439256560, todayTotal: true },
+    { key: 'A-02', id: '1kNZr4E9bv-h1OWI21MaaUIqsY71FisrhE1XxEMrC1zc', gid: 0,
+      mostRecentAgent: { dateCol: 1, nameCol: 2, hasYear: true } },
+    { key: 'A-03', id: '10JpTWiY8Zyb-FqJv382WRQzkzUacQmDu4Bb76BJFlPY', gid: 1727658513,
+      mostRecentAgent: { dateCol: 1, nameCol: 4, hasYear: false } },
+    { key: 'A-04', id: '1rckzDjsWgzmfGa_kWO4-pnrGfvJhe_3jPomESdKSS6M', gid: 1371404515, noStatus: true },
+    { key: 'B-01', id: '1vSqX_8WWXbxW2_6fRCrtTVUvnrBjVpKTNV1LMexqu6E', gid: 1230892015 },
+    { key: 'B-02', id: '1sRxLQFRhRN9NK4QsW_OHK7_DasF8hajYXmd6kFf6Gjw', gid: 301849897 }
+  ];
+
+  const result = {};
+
+  SHEETS.forEach(function (s) {
+    if (s.noStatus) { result[s.key] = {}; return; }
+
+    try {
+      const ss = SpreadsheetApp.openById(s.id);
+      const entry = {};
+
+      if (s.mostRecentAgent) {
+        const cfg = s.mostRecentAgent;
+        entry.updatedFor = findMostRecentlyUpdatedAgent(ss, cfg.dateCol, cfg.nameCol, cfg.hasYear);
+      } else {
+        const sheet = ss.getSheets().filter(function (sh) {
+          return sh.getSheetId() === s.gid;
+        })[0] || ss.getSheets()[0];
+
+        // "Last updated" note — cell AA1 (column 27, 1-based)
+        const aa1 = sheet.getRange(1, 27).getValue();
+        entry.lastUpdated = aa1 ? String(aa1).trim() : null;
+
+        if (s.todayTotal) {
+          const data = sheet.getDataRange().getValues();
+          entry.latest = computeLatestBlockTotal(data);
+        }
+      }
+
+      result[s.key] = entry;
+    } catch (err) {
+      result[s.key] = { error: String(err) };
+    }
+  });
+
+  return result;
+}
+
+// Finds the LAST (most recent) date-header block in the sheet — not one
+// matching a specific calendar date. This matters because shifts can
+// straddle midnight/timezones, so "today" by the script's clock isn't
+// always the block that should be shown.
+function computeLatestBlockTotal(rows) {
+  const dateRegex = /^\d{1,2}-[A-Za-z]{3}$/;
+
+  let headerRowIdx = -1;
+  let headerDateLabel = null;
+  for (let i = 0; i < rows.length; i++) {
+    const cell = String(rows[i][0]).trim();
+    if (dateRegex.test(cell)) {
+      headerRowIdx = i;       // keep overwriting — last match wins
+      headerDateLabel = cell; // blocks are assumed to be appended in order
+    }
+  }
+  if (headerRowIdx === -1) return null;
+
+  // Fixed columns: L = BANT, M = CCL, N = SVTV (0-based indices 11, 12, 13)
+  const COL_BANT = 11;
+  const COL_CCL  = 12;
+  const COL_SVTV = 13;
+
+  for (let i = headerRowIdx + 1; i < rows.length; i++) {
+    const label = String(rows[i][0]).trim().toLowerCase();
+    if (label === 'total') {
+      const bant = Number(rows[i][COL_BANT]) || 0;
+      const ccl  = Number(rows[i][COL_CCL]) || 0;
+      const svtv = Number(rows[i][COL_SVTV]) || 0;
+      return { bant: bant, ccl: ccl, svtv: svtv, total: bant + ccl + svtv, date: headerDateLabel };
+    }
+    if (i > headerRowIdx + 1 && dateRegex.test(String(rows[i][0]).trim())) break;
+  }
+  return null;
+}
+
+// Generic "which tab was touched most recently" lookup.
+// dateCol / nameCol are 1-based column numbers. hasYear tells us whether
+// to parse dates like "07-23-2026" (true) or "23-Jul" (false, assumes
+// current year). Any date in the future is treated as a bad/placeholder
+// value and ignored, so it can never win the "most recent" comparison.
+function findMostRecentlyUpdatedAgent(ss, dateCol, nameCol, hasYear) {
+  const sheets = ss.getSheets();
+  let latest = null; // { date, name, tab }
+  const now = new Date();
+
+  sheets.forEach(function (sheet) {
+    const lastRow = sheet.getLastRow();
+    if (lastRow < 2) return; // header only, no data rows
+
+    const dateVal = sheet.getRange(lastRow, dateCol).getValue();
+    const nameVal = sheet.getRange(lastRow, nameCol).getValue();
+    if (!nameVal) return;
+
+    const d = hasYear ? parseDateWithYear(dateVal) : parseDateNoYear(dateVal);
+    if (!d) return;
+    if (d > now) return; // ignore future / placeholder dates
+
+    if (!latest || d > latest.date) {
+      latest = { date: d, name: String(nameVal).trim(), tab: sheet.getName() };
+    }
+  });
+
+  if (!latest) return null;
+  return { name: latest.name, tab: latest.tab, date: Utilities.formatDate(latest.date, Session.getScriptTimeZone(), 'MMM d, yyyy') };
+}
+
+function parseDateWithYear(v) {
+  if (v instanceof Date && !isNaN(v.getTime())) return v;
+  if (typeof v === 'string' && v.trim()) {
+    const parts = v.trim().split(/[\/\-]/);
+    if (parts.length === 3) {
+      const mm = parseInt(parts[0], 10) - 1;
+      const dd = parseInt(parts[1], 10);
+      const yyyy = parseInt(parts[2], 10);
+      const d = new Date(yyyy, mm, dd);
+      if (!isNaN(d.getTime())) return d;
+    }
+  }
+  return null;
+}
+
+const MONTHS_ABBR = ['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'];
+function parseDateNoYear(v) {
+  if (v instanceof Date && !isNaN(v.getTime())) return v;
+  if (typeof v === 'string' && v.trim()) {
+    const m = v.trim().match(/^(\d{1,2})-([A-Za-z]{3})$/);
+    if (m) {
+      const dd = parseInt(m[1], 10);
+      const mon = MONTHS_ABBR.indexOf(m[2].toLowerCase());
+      if (mon !== -1) {
+        const d = new Date(new Date().getFullYear(), mon, dd);
+        if (!isNaN(d.getTime())) return d;
+      }
+    }
+  }
+  return null;
+}
+
+// ============================================================
+// Lead Scoring auto-update trigger
+// Whenever an agent types a score into their row (any column left of
+// the L/M/N total formulas), stamp their name + time into AA1 for that
+// sheet. Run setupLeadScoringTrigger() once from the editor to install.
+// ============================================================
+
+function setupLeadScoringTrigger() {
+  // Clear any previous copy of this trigger first, so re-running this
+  // setup function doesn't create duplicates.
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === 'onScoreEdit') ScriptApp.deleteTrigger(t);
+  });
+
+  const ss = SpreadsheetApp.openById(LEAD_SCORING_ID);
+  ScriptApp.newTrigger('onScoreEdit')
+    .forSpreadsheet(ss)
+    .onEdit()
+    .create();
+}
+
+function onScoreEdit(e) {
+  try {
+    const range = e.range;
+    const sheet = range.getSheet();
+    const row = range.getRow();
+    const col = range.getColumn();
+
+    if (row < 2) return;      // ignore header/date row
+    if (col >= 12) return;    // ignore edits to the L/M/N total formulas themselves
+
+    const agentName = sheet.getRange(row, 1).getValue();
+    if (!agentName) return;
+
+    const label = String(agentName).trim().toLowerCase();
+    if (label === 'total' || /^\d{1,2}-[a-z]{3}$/.test(label)) return; // skip Total row / date-header row
+
+    const stamp = agentName + ' · ' + Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'MMM d, h:mm a');
+    sheet.getRange(1, 27).setValue(stamp); // AA1
+  } catch (err) {
+    // Never let this block the agent's actual edit.
+  }
+}
